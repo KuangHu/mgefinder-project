@@ -1,0 +1,150 @@
+# MGEfinder Pipeline Status
+# Last updated: 2026-02-07
+
+## Current Status: BATCH1 IS EXTRACTION DONE + BATCH2 DOWNLOADS IN PROGRESS
+
+### Directory Structure (UPDATED):
+```
+/global/scratch/users/kh36969/
+├── mgefinder_batch1/    # Batch 1: ~10K samples (COMPLETE through IS extraction)
+│   ├── samples/         # 9,869 sample directories
+│   ├── reference_genomes/
+│   ├── batches/
+│   ├── jobs/
+│   ├── scripts/
+│   └── is_extraction_results/   # Combined summary TSV
+│
+├── mgefinder_batch2/    # Batch 2: 100K samples (DOWNLOADS IN PROGRESS)
+│   ├── samples/         # 92,043 sample directories (assembly + reference only)
+│   ├── reference_genomes -> mgefinder_batch1/reference_genomes  (symlink)
+│   ├── jobs/batch2_download/    # 100 array jobs (1000 samples each)
+│   ├── jobs/batch2_prepare/     # Ready to submit after downloads
+│   └── jobs/batch2_mgefinder/   # Ready to submit after prepare
+│
+└── mgefinder_project/   # Python modules (home dir)
+    ├── is_extractor/    # IS element extractor + Prodigal annotation
+    ├── download_manager/
+    └── STATUS.txt       # This file
+```
+
+---
+
+## BATCH 1 (~10K samples) — COMPLETE
+
+### Completed Steps:
+1. Reference genome downloads - DONE (2,277 genomes)
+2. Sample downloads - DONE (9,869 samples)
+3. Prepare (BWA + BAM) - DONE (9,283 BAM files)
+4. MGEfinder analysis - DONE (7,510 samples with IS elements)
+5. IS Extraction + Prodigal Annotation - DONE (job 20999215, 82 min)
+   - 7,510 samples processed (6,313 new + 1,197 resumed), 0 failures
+   - 1,186,547 IS elements extracted
+   - 3,627,740 ORFs predicted by Prodigal
+   - Per-sample JSON: samples/{SAMPLE}/is_extraction/is_elements.json
+   - Summary TSV: is_extraction_results/batch1_is_elements_summary.tsv
+6. IS Circle Detection jobs - SUBMITTED (jobs 20973373-20973380)
+
+### IS Element Dictionary Structure (per element):
+```
+is_id, sample, seqid, cluster, group, confidence
+├── is_element:          sequence, length, contig, start, end, method
+├── flanking_upstream:   sequence, start, end, length, contig
+├── flanking_downstream: sequence, start, end, length, contig
+├── insertion_site:      contig, pos_5p, pos_3p
+└── orf_annotation:
+    ├── num_orfs, coding_fraction, total_coding_bp, total_noncoding_bp
+    ├── orfs[]:          orf_id, start, end, strand, dna_sequence, protein_sequence, length_aa
+    └── noncoding_regions[]: start, end, length, type, sequence
+```
+
+### Batch 1 Key Files:
+- IS extraction script: /global/scratch/users/kh36969/mgefinder_batch1/scripts/run_is_extraction.py
+- IS extraction SLURM: /global/scratch/users/kh36969/mgefinder_batch1/scripts/run_is_extraction.sh
+- Summary TSV: /global/scratch/users/kh36969/mgefinder_batch1/is_extraction_results/batch1_is_elements_summary.tsv
+- Samples with IS: /global/scratch/users/kh36969/mgefinder_batch1/batch1_with_is.txt (7,510)
+
+---
+
+## BATCH 2 (100K samples) — IN PROGRESS
+
+### Current Status:
+- 92,043 samples have assembly + reference downloaded
+- 7,957 samples not yet downloaded at all
+- FASTQ reads download: IN PROGRESS (all 100 array jobs submitted)
+- Parts 1-16 completed, part 17+ working through queue
+
+### Download Jobs:
+- Jobs 20999889-20999987: parts 1-97 submitted (97,000 samples)
+- Jobs 21003277-21003278: parts 98-99 submitted
+- Job 21023938: part 100 submitted
+
+### What Each Sample Has (before download jobs):
+| Component   | Count  | Status          |
+|-------------|--------|-----------------|
+| Assembly    | 92,039 | Done            |
+| Reference   | 92,047 | Done            |
+| Reads/FASTQ | ~0     | Downloading now |
+
+---
+
+## NEXT STEPS (in order):
+
+### Step 1: Submit remaining download part
+```bash
+sbatch /global/scratch/users/kh36969/mgefinder_batch2/jobs/batch2_download/part100/download.slurm
+```
+
+### Step 2: Monitor batch2 downloads
+```bash
+# Check job status
+squeue -u kh36969 | grep dl_batch | wc -l
+
+# Count completed reads
+find /global/scratch/users/kh36969/mgefinder_batch2/samples -maxdepth 3 -name "*_R1.fastq.gz" | wc -l
+# Target: 100,000
+```
+
+### Step 3: Run Prepare (BWA + BAM) for batch2
+```bash
+# Create log dirs first
+for i in $(seq 1 100); do
+    mkdir -p /global/scratch/users/kh36969/mgefinder_batch2/jobs/batch2_prepare/part${i}/logs
+done
+
+bash /global/scratch/users/kh36969/mgefinder_batch2/jobs/batch2_prepare/submit_all.sh
+```
+
+### Step 4: Run MGEfinder for batch2
+```bash
+for i in $(seq 1 100); do
+    mkdir -p /global/scratch/users/kh36969/mgefinder_batch2/jobs/batch2_mgefinder/part${i}/logs
+done
+
+bash /global/scratch/users/kh36969/mgefinder_batch2/jobs/batch2_mgefinder/submit_all.sh
+```
+
+### Step 5: Run IS Extraction + Annotation for batch2
+- Update run_is_extraction.py paths to point to mgefinder_batch2
+- Submit with full node (same as batch1)
+
+### Step 6: Check Batch1 IS Circle Detection results
+```bash
+# Check if circle detection jobs completed
+sacct -j 20973373,20973374,20973375,20973376,20973377,20973378,20973379,20973380 --format=JobID,State,ExitCode
+
+# Count results
+find /global/scratch/users/kh36969/mgefinder_batch1/samples -name "circularized_is.tsv" | wc -l
+```
+
+---
+
+## Code Fixes Applied:
+- extractor.py: Added `csv.field_size_limit(sys.maxsize)` for large IS sequences
+- run_is_extraction.py: Uses ProcessPoolExecutor with 30 workers for parallel processing
+- run_is_extraction.py: Skips already-completed samples on restart
+
+## Notes:
+- B-PPI is a SEPARATE project at /global/home/users/kh36969/BPPI_project/ (not part of MGEfinder)
+- Old stuck job 20707841_285 in CG state can be ignored
+- Batch2 job scripts reference paths under mgefinder_batch2/ (already correct)
+- Reference genomes in mgefinder_batch2 are a symlink to mgefinder_batch1/reference_genomes
