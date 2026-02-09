@@ -359,3 +359,33 @@ Per-step resources:
 | 3. run_mgefinder | 8 | 32 GB | 24h | Array job (1 sample/task) |
 | 4. run_is_extraction | 32 (exclusive) | full node | 6h | Single node, 30 Python workers |
 | 5. detect_circularized_is | 8 | default | 4h | Array job (1 sample/task) |
+
+---
+
+## Archiving a Batch
+
+**What it does**: Creates a compressed tar.gz of the batch directory, excluding
+large regenerable files (FASTQ reads, BAM alignments, BWA indexes). This preserves
+all results (MGEfinder output, IS extractions, circle analysis) at a fraction of the
+original size.
+
+**Script**: `scripts/archive_batch.sh`
+
+**How to run**:
+```bash
+# Archive with default output path ({parent_dir}/mgefinder_batchN_results.tar.gz)
+bash scripts/archive_batch.sh /global/scratch/users/kh36969/mgefinder_batch1
+
+# Custom output path
+bash scripts/archive_batch.sh /global/scratch/users/kh36969/mgefinder_batch1 /path/to/batch1_results.tar.gz
+```
+
+**Excluded file types**:
+- `*.fastq.gz` — raw reads (~1-3 GB per sample)
+- `*.bam`, `*.bam.bai` — alignments
+- `*.bwt`, `*.pac`, `*.ann`, `*.amb`, `*.sa` — BWA indexes (regenerable)
+
+**To extract**:
+```bash
+tar xzf mgefinder_batch1_results.tar.gz -C /path/to/destination
+```
