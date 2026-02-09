@@ -2,6 +2,8 @@
 IS Element Extractor
 
 Extract IS element DNA sequences and flanking regions from MGEfinder output.
+Flanking regions are extracted from the assembly contig where the IS sits,
+ensuring upstream_flank → IS_element → downstream_flank are contiguous.
 """
 
 import os
@@ -39,46 +41,10 @@ def parse_fasta(fasta_path: str) -> Dict[str, str]:
     return sequences
 
 
-def extract_flanking(genome_seq: str, pos_5p: int, pos_3p: int,
-                     flank_size: int = 80) -> Dict[str, dict]:
-    """
-    Extract flanking regions from genome sequence.
-
-    Args:
-        genome_seq: Full genome sequence string
-        pos_5p: 5' position (1-based)
-        pos_3p: 3' position (1-based)
-        flank_size: Size of flanking region to extract (default 80bp)
-
-    Returns:
-        Dictionary with upstream and downstream flanking info
-    """
-    genome_len = len(genome_seq)
-
-    # Determine insertion site boundaries (handle both orientations)
-    left_pos = min(pos_5p, pos_3p)
-    right_pos = max(pos_5p, pos_3p)
-
-    # Calculate flanking region coordinates (convert to 0-based)
-    upstream_start = max(0, left_pos - 1 - flank_size)
-    upstream_end = left_pos - 1
-    downstream_start = right_pos  # already 0-based after -1+1
-    downstream_end = min(genome_len, right_pos + flank_size)
-
-    return {
-        'upstream': {
-            'sequence': genome_seq[upstream_start:upstream_end],
-            'start': upstream_start + 1,  # back to 1-based
-            'end': upstream_end,
-            'length': upstream_end - upstream_start
-        },
-        'downstream': {
-            'sequence': genome_seq[downstream_start:downstream_end],
-            'start': downstream_start + 1,  # back to 1-based
-            'end': downstream_end,
-            'length': downstream_end - downstream_start
-        }
-    }
+def reverse_complement(seq: str) -> str:
+    """Return the reverse complement of a DNA sequence."""
+    comp = str.maketrans('ACGTacgt', 'TGCAtgca')
+    return seq.translate(comp)[::-1]
 
 
 class ISExtractor:
@@ -90,7 +56,7 @@ class ISExtractor:
 
         Args:
             sample_dir: Path to MGEfinder sample directory
-                       (containing 00.genome, 03.results, etc.)
+                       (containing 00.genome, 00.assembly, 03.results, etc.)
             flank_size: Size of flanking regions to extract (default 80bp)
         """
         self.sample_dir = Path(sample_dir)
@@ -99,12 +65,14 @@ class ISExtractor:
 
         # Define file paths
         self.genome_path = self.sample_dir / "00.genome" / "genome.fna"
+        self.assembly_path = self.sample_dir / "00.assembly" / f"{self.sample_id}.fna"
         self.clusterseq_path = self.sample_dir / "03.results" / "genome" / "01.clusterseq.genome.tsv"
         self.genotype_path = self.sample_dir / "03.results" / "genome" / "02.genotype.genome.tsv"
         self.fasta_path = self.sample_dir / "03.results" / "genome" / "04.makefasta.genome.repr_seqs.fna"
 
         # Cache for loaded data
         self._genome_seqs = None
+        self._assembly_seqs = None
         self._is_sequences = None
 
     def _load_genome(self) -> Dict[str, str]:
@@ -114,6 +82,15 @@ class ISExtractor:
                 raise FileNotFoundError(f"Genome file not found: {self.genome_path}")
             self._genome_seqs = parse_fasta(str(self.genome_path))
         return self._genome_seqs
+
+    def _load_assembly(self) -> Dict[str, str]:
+        """Load assembly contig sequences."""
+        if self._assembly_seqs is None:
+            if not self.assembly_path.exists():
+                self._assembly_seqs = {}
+            else:
+                self._assembly_seqs = parse_fasta(str(self.assembly_path))
+        return self._assembly_seqs
 
     def _load_is_sequences(self) -> Dict[str, str]:
         """Load IS element sequences from FASTA."""
@@ -161,20 +138,112 @@ class ISExtractor:
             return False
         return self.check_results_exist()
 
+    def _detect_strand(self, is_sequence: str, contig_seq: str,
+                       start: int, end: int) -> str:
+        """
+        Detect whether the IS element is on the forward or reverse strand
+        of the assembly contig.
+
+        Args:
+            is_sequence: The inferred IS element sequence
+            contig_seq: The full assembly contig sequence
+            start: Start position (0-based)
+            end: End position (0-based, exclusive)
+
+        Returns:
+            '+' for forward strand, '-' for reverse strand, '?' if unknown
+        """
+        if not is_sequence or not contig_seq or start >= end:
+            return '?'
+
+        sub = contig_seq[start:end].upper()
+        is_upper = is_sequence.upper()
+
+        if sub == is_upper:
+            return '+'
+        if reverse_complement(sub) == is_upper:
+            return '-'
+        return '?'
+
+    def _extract_flanking_from_assembly(self, contig_seq: str, start: int,
+                                         end: int, strand: str) -> dict:
+        """
+        Extract flanking regions from the assembly contig.
+
+        The returned upstream/downstream are always in the IS element's
+        reading frame:
+          upstream_flank → IS_element → downstream_flank
+
+        For forward strand (+):
+          upstream  = contig[start-flank : start]
+          downstream = contig[end : end+flank]
+
+        For reverse strand (-):
+          upstream  = revcomp(contig[end : end+flank])
+          downstream = revcomp(contig[start-flank : start])
+
+        Args:
+            contig_seq: Full assembly contig sequence
+            start: IS start on contig (0-based)
+            end: IS end on contig (0-based, exclusive)
+            strand: '+' or '-'
+
+        Returns:
+            Dict with 'upstream' and 'downstream' flanking info
+        """
+        contig_len = len(contig_seq)
+        flank = self.flank_size
+
+        # Extract raw flanking from contig coordinates
+        left_start = max(0, start - flank)
+        left_seq = contig_seq[left_start:start]
+        right_seq = contig_seq[end:min(contig_len, end + flank)]
+
+        if strand == '-':
+            # IS is on reverse strand: flip and revcomp
+            upstream_seq = reverse_complement(right_seq)
+            upstream_contig_start = end + 1                    # 1-based
+            upstream_contig_end = min(contig_len, end + flank)
+
+            downstream_seq = reverse_complement(left_seq)
+            downstream_contig_start = left_start + 1           # 1-based
+            downstream_contig_end = start
+        else:
+            # Forward strand (or unknown): use as-is
+            upstream_seq = left_seq
+            upstream_contig_start = left_start + 1             # 1-based
+            upstream_contig_end = start
+
+            downstream_seq = right_seq
+            downstream_contig_start = end + 1                  # 1-based
+            downstream_contig_end = min(contig_len, end + flank)
+
+        return {
+            'upstream': {
+                'sequence': upstream_seq,
+                'length': len(upstream_seq),
+                'contig_start': upstream_contig_start,
+                'contig_end': upstream_contig_end,
+            },
+            'downstream': {
+                'sequence': downstream_seq,
+                'length': len(downstream_seq),
+                'contig_start': downstream_contig_start,
+                'contig_end': downstream_contig_end,
+            }
+        }
+
     def extract(self) -> List[Dict]:
         """
         Extract all IS elements with their sequences and flanking regions.
 
+        Flanking regions are extracted from the assembly contig where the IS
+        element sits, in the IS element's reading frame. This ensures:
+            upstream_flank → IS_element → downstream_flank
+        are contiguous and on the same contig.
+
         Returns:
-            List of dictionaries, one per IS element, containing:
-            - is_id: Unique identifier for this IS element
-            - sample: Sample ID
-            - seqid: Sequence ID from MGEfinder
-            - cluster: Cluster ID
-            - group: Group ID
-            - is_element: Dict with sequence and location info
-            - flanking_upstream: Dict with upstream flanking sequence and location
-            - flanking_downstream: Dict with downstream flanking sequence and location
+            List of dictionaries, one per IS element.
         """
         if not self.check_results_exist():
             return []
@@ -183,8 +252,7 @@ class ISExtractor:
             return []
 
         # Load data
-        genome_seqs = self._load_genome()
-        is_fasta_seqs = self._load_is_sequences()
+        assembly_seqs = self._load_assembly()
         clusterseq_records = self._parse_clusterseq()
         genotype_records = self._parse_genotype()
 
@@ -195,8 +263,7 @@ class ISExtractor:
             cluster = record.get('cluster', '')
             group = record.get('group', '')
 
-            # Get IS element sequence
-            # Try from clusterseq first (inferred_seq column)
+            # Get IS element sequence from inferred_seq column
             is_sequence = record.get('inferred_seq', '')
 
             # Parse location from 'loc' column (e.g., "SAMN30697274.contig00004:127020-249243")
@@ -213,61 +280,42 @@ class ISExtractor:
                     is_start = int(start_end[0])
                     is_end = int(start_end[1])
 
-            # Get insertion site info from genotype for flanking regions
+            # Get insertion site info from genotype
             genotype = genotype_records.get(seqid, {})
             ref_contig = genotype.get('contig', '')
             pos_5p = int(genotype.get('pos_5p', 0)) if genotype.get('pos_5p') else 0
             pos_3p = int(genotype.get('pos_3p', 0)) if genotype.get('pos_3p') else 0
 
+            # Detect strand and extract flanking from assembly contig
+            strand = '?'
+            flanking_upstream = {
+                'sequence': '', 'length': 0,
+                'contig_start': 0, 'contig_end': 0,
+            }
+            flanking_downstream = {
+                'sequence': '', 'length': 0,
+                'contig_start': 0, 'contig_end': 0,
+            }
+
+            if is_contig and is_contig in assembly_seqs and is_start < is_end:
+                contig_seq = assembly_seqs[is_contig]
+                strand = self._detect_strand(is_sequence, contig_seq, is_start, is_end)
+                flanking = self._extract_flanking_from_assembly(
+                    contig_seq, is_start, is_end, strand)
+                flanking_upstream = flanking['upstream']
+                flanking_downstream = flanking['downstream']
+
             # Build IS element dict
             is_element = {
                 'sequence': is_sequence,
                 'length': len(is_sequence),
-                'source_file': str(self.clusterseq_path),
                 'contig': is_contig,
                 'start': is_start,
                 'end': is_end,
-                'method': record.get('method', '')
+                'strand': strand,
+                'method': record.get('method', ''),
+                'source_file': str(self.clusterseq_path),
             }
-
-            # Extract flanking regions from reference genome
-            flanking_upstream = {
-                'sequence': '',
-                'start': 0,
-                'end': 0,
-                'length': 0,
-                'source_file': '',
-                'contig': ''
-            }
-            flanking_downstream = {
-                'sequence': '',
-                'start': 0,
-                'end': 0,
-                'length': 0,
-                'source_file': '',
-                'contig': ''
-            }
-
-            if ref_contig and ref_contig in genome_seqs and pos_5p > 0 and pos_3p > 0:
-                genome_seq = genome_seqs[ref_contig]
-                flanking = extract_flanking(genome_seq, pos_5p, pos_3p, self.flank_size)
-
-                flanking_upstream = {
-                    'sequence': flanking['upstream']['sequence'],
-                    'start': flanking['upstream']['start'],
-                    'end': flanking['upstream']['end'],
-                    'length': flanking['upstream']['length'],
-                    'source_file': str(self.genome_path),
-                    'contig': ref_contig
-                }
-                flanking_downstream = {
-                    'sequence': flanking['downstream']['sequence'],
-                    'start': flanking['downstream']['start'],
-                    'end': flanking['downstream']['end'],
-                    'length': flanking['downstream']['length'],
-                    'source_file': str(self.genome_path),
-                    'contig': ref_contig
-                }
 
             # Build final record
             is_record = {
@@ -279,8 +327,16 @@ class ISExtractor:
                 'pair_id': record.get('pair_id', ''),
                 'confidence': genotype.get('conf', ''),
                 'is_element': is_element,
-                'flanking_upstream': flanking_upstream,
-                'flanking_downstream': flanking_downstream,
+                'flanking_upstream': {
+                    **flanking_upstream,
+                    'source_file': str(self.assembly_path),
+                    'contig': is_contig,
+                },
+                'flanking_downstream': {
+                    **flanking_downstream,
+                    'source_file': str(self.assembly_path),
+                    'contig': is_contig,
+                },
                 'insertion_site': {
                     'contig': ref_contig,
                     'pos_5p': pos_5p,

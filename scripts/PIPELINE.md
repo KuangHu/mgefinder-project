@@ -225,13 +225,30 @@ bash scripts/run_mgefinder.sh /global/scratch/users/kh36969/mgefinder_batchN --d
 
 ## Step 4: Extract IS Elements
 
-**What it does**: Extracts detailed IS element information (sequence, flanking regions,
-insertion sites) and annotates them with Prodigal ORF predictions. Runs on a single
-node with 30 parallel workers (not a SLURM array — IS extraction is lightweight).
+**What it does**: Extracts detailed IS element information from MGEfinder output:
 
-**Script**: `scripts/run_is_extraction.sh` (wraps `scripts/run_is_extraction.py`)
+1. **IS element sequence** — from `clusterseq.genome.tsv` (`inferred_seq` column)
+2. **Flanking regions** (default 80 bp) — extracted from the **assembly contig** where the
+   IS element sits, ensuring `upstream_flank → IS_element → downstream_flank` are
+   contiguous on the same contig. Strand is auto-detected so flanking is always in the
+   IS element's reading frame.
+3. **ORF annotation** — Prodigal predicts coding regions (ORFs) and noncoding regions
+   within each IS element sequence.
+4. **Insertion site** — reference genome coordinates from `genotype.genome.tsv`.
 
-**Prerequisites**: Step 3 complete (IS FASTA files exist). Requires `module load bio/prodigal`.
+IS elements detected only via `inferred_database` or `inferred_reference` (i.e., no
+assembly contig mapping) will have empty flanking regions, since their full sequence
+does not exist contiguously in the assembly.
+
+Runs on a single node with 30 parallel workers (not a SLURM array — IS extraction is
+lightweight per sample).
+
+**Scripts**:
+- `scripts/run_is_extraction.sh` — SLURM wrapper
+- `scripts/run_is_extraction.py` — Python extraction logic
+- `is_extractor/` module — `extractor.py` (extraction), `orf_finder.py` (ORF annotation)
+
+**Prerequisites**: Step 2 (assembly) + Step 3 (MGEfinder results). Requires `module load bio/prodigal`.
 
 **How to run**:
 ```bash
@@ -251,6 +268,22 @@ python scripts/run_is_extraction.py --samples-dir /path/to/samples --sample-list
 - Per-sample: `samples/{SAMPLE}/is_extraction/is_elements.json`
 - Summary: `is_extraction_results/is_elements_summary.tsv`
 
+**JSON output structure** (per IS element):
+```
+is_id, sample, seqid, cluster, group, pair_id, confidence
+is_element:
+  sequence, length, contig, start, end, strand, method
+flanking_upstream:
+  sequence, length, contig_start, contig_end, contig
+flanking_downstream:
+  sequence, length, contig_start, contig_end, contig
+insertion_site:
+  contig, pos_5p, pos_3p
+orf_annotation:
+  orfs: [{orf_id, start, end, strand, dna_sequence, protein_sequence, ...}]
+  noncoding_regions: [{start, end, length, type, sequence}]
+```
+
 **How to check status**:
 ```bash
 # Count completed samples
@@ -258,6 +291,28 @@ ls -1 samples/SAM*/is_extraction/is_elements.json 2>/dev/null | wc -l
 
 # Check summary TSV row count
 wc -l is_extraction_results/is_elements_summary.tsv
+```
+
+### Verifying IS Extraction Results
+
+`scripts/verify_is_extraction.py` validates that the JSON output is self-consistent:
+
+1. **Contiguity check** — `upstream_flank + IS_sequence + downstream_flank` matches
+   the assembly contig at the recorded coordinates (handles both + and - strand).
+2. **ORF tiling check** — ORFs + noncoding regions tile the IS sequence completely
+   with no gaps, and each subsequence matches at its recorded coordinates.
+
+```bash
+cd ~/mgefinder_project
+
+# Live test: run extractor on a sample and verify (no existing JSON needed)
+python scripts/verify_is_extraction.py --live /path/to/samples/SAMEA1234567 -v
+
+# Verify existing JSON for a sample
+python scripts/verify_is_extraction.py /path/to/samples/SAMEA1234567
+
+# Batch verify all samples with JSON files
+python scripts/verify_is_extraction.py --batch /path/to/samples --max-samples 50
 ```
 
 ---
