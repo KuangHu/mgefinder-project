@@ -6,13 +6,15 @@
 #SBATCH --time=04:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=32
+#SBATCH --exclusive
 
 #===============================================================================
 # detect_circularized_is.sh
 #
 # Detect circularized IS elements using Circle-Map.
-# Supports SLURM array jobs with automatic sample discovery and batching.
+# Each SLURM array task processes a chunk of 32 samples on a full node,
+# running them in parallel (1 CPU per sample).
 #
 # Usage:
 #   # Launcher mode - discover samples and submit jobs
@@ -24,163 +26,103 @@
 
 set -euo pipefail
 
+SAMPLES_PER_NODE=32
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MODE DETECTION: launcher vs. SLURM worker
+# SINGLE SAMPLE PROCESSING FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
+process_sample() {
+    local SAMPLE="$1"
+    local SAMPLES_DIR="$2"
+    local SCRIPTS_DIR="$3"
+    local THREADS=1
 
-if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    # =========================================================================
-    # WORKER MODE: process a single sample
-    # =========================================================================
+    local SAMPLE_DIR="$SAMPLES_DIR/$SAMPLE"
+    local WORK_DIR="$SAMPLE_DIR/is_circle_analysis"
 
-    BASE_DIR="$1"
-    BATCH_NUM="${2:-1}"
-    SAMPLES_DIR="${BASE_DIR}/samples"
-    SCRIPTS_DIR="${BASE_DIR}/scripts"
-    SAMPLE_LIST="${SCRIPTS_DIR}/.is_circle_queue_batch${BATCH_NUM}.txt"
-    THREADS="${SLURM_CPUS_PER_TASK:-8}"
-
-    SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$SAMPLE_LIST")
-
-    if [[ -z "$SAMPLE" ]]; then
-        echo "ERROR: No sample found at line $SLURM_ARRAY_TASK_ID"
-        exit 1
-    fi
-
-    SAMPLE_DIR="$SAMPLES_DIR/$SAMPLE"
-    WORK_DIR="$SAMPLE_DIR/is_circle_analysis"
-
-    echo "=============================================="
-    echo "Detecting Circularized IS Elements"
-    echo "=============================================="
-    echo "Sample: $SAMPLE"
-    echo "Batch: ${BATCH_NUM}, Job ID: ${SLURM_JOB_ID}, Task: ${SLURM_ARRAY_TASK_ID}"
-    echo "Start: $(date)"
-    echo "=============================================="
-
-    # Activate conda environment (temporarily disable -u for conda scripts with unbound variables)
-    set +u
-    source $(conda info --base)/etc/profile.d/conda.sh
-    conda activate mgefinder
-    set -u
+    echo "[${SAMPLE}] Starting at $(date '+%H:%M:%S')"
 
     # Create work directory
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR"
 
-    # ============================================
-    # Check Prerequisites
-    # ============================================
-
-    # Check for IS sequences
-    IS_FASTA="$SAMPLE_DIR/03.results/genome/04.makefasta.genome.all_seqs.fna"
-    NO_MGE_FILE="$SAMPLE_DIR/03.results/genome/NO_MGE_DETECTED.txt"
+    # ── Check Prerequisites ──
+    local IS_FASTA="$SAMPLE_DIR/03.results/genome/04.makefasta.genome.all_seqs.fna"
+    local NO_MGE_FILE="$SAMPLE_DIR/03.results/genome/NO_MGE_DETECTED.txt"
 
     if [[ -f "$NO_MGE_FILE" ]]; then
-        echo "No MGEs detected for this sample"
+        echo "[${SAMPLE}] No MGEs detected, skipping"
         echo "SKIPPED:NO_MGE" > status.txt
-        exit 0
+        return 0
     fi
 
     if [[ ! -f "$IS_FASTA" ]] || [[ ! -s "$IS_FASTA" ]]; then
-        echo "No IS sequences found for $SAMPLE"
+        echo "[${SAMPLE}] No IS sequences found, skipping"
         echo "SKIPPED:NO_IS_FILE" > status.txt
-        exit 0
+        return 0
     fi
 
-    # Check for FASTQ files
-    READS_R1="$SAMPLE_DIR/00.reads/${SAMPLE}_R1.fastq.gz"
-    READS_R2="$SAMPLE_DIR/00.reads/${SAMPLE}_R2.fastq.gz"
+    local READS_R1="$SAMPLE_DIR/00.reads/${SAMPLE}_R1.fastq.gz"
+    local READS_R2="$SAMPLE_DIR/00.reads/${SAMPLE}_R2.fastq.gz"
 
     if [[ ! -f "$READS_R1" ]] || [[ ! -f "$READS_R2" ]]; then
-        echo "FASTQ files not found (may have been cleaned up)"
+        echo "[${SAMPLE}] FASTQ files not found, skipping"
         echo "SKIPPED:NO_FASTQ" > status.txt
-        exit 0
+        return 0
     fi
 
-    # ============================================
-    # Step 1: Extract IS Reference
-    # ============================================
-    echo ""
-    echo "Step 1: Extracting IS reference sequences..."
-
+    # ── Step 1: Extract IS Reference ──
     python "$SCRIPTS_DIR/extract_is_reference.py" \
         --sample-dir "$SAMPLE_DIR" \
         --output is_reference.fna \
         --min-length 500 \
-        --max-length 5000
+        --max-length 5000 2>/dev/null
 
     if [[ ! -s is_reference.fna ]]; then
-        echo "No valid IS sequences extracted (all filtered by length)"
+        echo "[${SAMPLE}] No valid IS sequences (filtered by length)"
         echo "SKIPPED:NO_VALID_IS" > status.txt
-        exit 0
+        return 0
     fi
 
-    IS_COUNT=$(grep -c "^>" is_reference.fna)
-    echo "Extracted $IS_COUNT IS sequences"
-
-    # ============================================
-    # Step 2: Align Reads to IS Reference
-    # ============================================
-    echo ""
-    echo "Step 2: Aligning reads to IS-only reference..."
-
-    # Index reference
+    # ── Step 2: Align Reads to IS Reference ──
     bwa index is_reference.fna 2>/dev/null
 
-    # Align
     bwa mem -t $THREADS is_reference.fna "$READS_R1" "$READS_R2" 2>bwa.log | \
         samtools sort -@ $THREADS -o is_aligned.bam -
 
     samtools index is_aligned.bam
 
-    # Check alignment rate
-    TOTAL_READS=$(samtools view -c is_aligned.bam)
+    local MAPPED_READS
     MAPPED_READS=$(samtools view -c -F 4 is_aligned.bam)
-    echo "Total reads: $TOTAL_READS"
-    echo "Mapped to IS: $MAPPED_READS"
 
     if [[ $MAPPED_READS -lt 100 ]]; then
-        echo "Too few reads mapped to IS reference"
+        echo "[${SAMPLE}] Too few reads mapped ($MAPPED_READS), skipping"
         echo "SKIPPED:LOW_MAPPING" > status.txt
         rm -f *.bam *.bam.bai
-        exit 0
+        return 0
     fi
 
-    # ============================================
-    # Step 3: Run Circle-Map
-    # ============================================
-    echo ""
-    echo "Step 3: Running Circle-Map on IS reference..."
-
-    # Sort by read name for Circle-Map
+    # ── Step 3: Run Circle-Map ──
     samtools sort -n -@ $THREADS -o is_aligned.qname.bam is_aligned.bam
 
-    # Extract circular candidate reads
-    echo "  Extracting circular candidate reads..."
     Circle-Map ReadExtractor \
         -i is_aligned.qname.bam \
         -o circular_candidates.bam 2>readextractor.log
 
-    # Check if any candidates found
+    local CANDIDATES
     CANDIDATES=$(samtools view -c circular_candidates.bam 2>/dev/null || echo "0")
-    echo "  Circular candidate reads: $CANDIDATES"
 
     if [[ "$CANDIDATES" -lt 10 ]]; then
-        echo "  No circular candidates found"
+        echo "[${SAMPLE}] No circular candidates ($CANDIDATES reads)"
         echo "COMPLETED:0:NO_CANDIDATES" > status.txt
-        # Still create empty output file
         echo -e "is_id\tis_length\tcircle_start\tcircle_end\tcircle_length\tlength_ratio\tsplit_reads\tdiscordant_reads\tscore\tvalidation" > circularized_is.tsv
         rm -f *.bam *.bam.bai
-        exit 0
+        return 0
     fi
 
-    # Sort and index candidates
     samtools sort -@ $THREADS -o circular_candidates.sorted.bam circular_candidates.bam
     samtools index circular_candidates.sorted.bam
 
-    # Run Circle-Map Realign
-    echo "  Running Circle-Map Realign..."
     Circle-Map Realign -t $THREADS \
         -i circular_candidates.sorted.bam \
         -qbam is_aligned.qname.bam \
@@ -188,68 +130,109 @@ if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
         -fasta is_reference.fna \
         -o is_circles.bed 2>realign.log
 
-    # Check Circle-Map output
     if [[ ! -s is_circles.bed ]]; then
-        echo "  No circles detected by Circle-Map"
+        echo "[${SAMPLE}] No circles detected"
         echo "COMPLETED:0:NO_CIRCLES" > status.txt
         echo -e "is_id\tis_length\tcircle_start\tcircle_end\tcircle_length\tlength_ratio\tsplit_reads\tdiscordant_reads\tscore\tvalidation" > circularized_is.tsv
         rm -f *.bam *.bam.bai
-        exit 0
+        return 0
     fi
 
-    CIRCLE_COUNT=$(wc -l < is_circles.bed)
-    echo "  Raw circles detected: $CIRCLE_COUNT"
-
-    # ============================================
-    # Step 4: Validate Results
-    # ============================================
-    echo ""
-    echo "Step 4: Validating circles against IS lengths..."
-
+    # ── Step 4: Validate Results ──
     python "$SCRIPTS_DIR/validate_is_circles.py" \
         --circles is_circles.bed \
         --reference is_reference.fna \
         --output circularized_is.tsv \
         --tolerance 0.1 \
-        --min-reads 2
+        --min-reads 2 2>/dev/null
 
-    # ============================================
-    # Summary
-    # ============================================
-    echo ""
-    echo "=============================================="
-
+    # ── Summary ──
     if [[ -s circularized_is.tsv ]]; then
+        local CONFIRMED LIKELY TOTAL
         CONFIRMED=$(grep -c "CONFIRMED_CIRCULAR_IS" circularized_is.tsv || echo "0")
         LIKELY=$(grep -c "LIKELY_CIRCULAR_IS" circularized_is.tsv || echo "0")
         TOTAL=$((CONFIRMED + LIKELY))
-
-        echo "RESULTS:"
-        echo "  Confirmed circular IS: $CONFIRMED"
-        echo "  Likely circular IS: $LIKELY"
+        echo "[${SAMPLE}] Done: ${CONFIRMED} confirmed, ${LIKELY} likely circular IS"
         echo "COMPLETED:$TOTAL:CONFIRMED=$CONFIRMED,LIKELY=$LIKELY" > status.txt
     else
-        echo "No circularized IS elements detected"
-        echo "COMPLETED:0" > status.txt
+        echo "[${SAMPLE}] Done: no circularized IS"
+        echo "COMPLETED:0:NO_CIRCLES" > status.txt
     fi
 
-    # ============================================
-    # Cleanup intermediate files
-    # ============================================
-    echo ""
-    echo "Cleaning up intermediate files..."
-    rm -f *.bam *.bam.bai
-    rm -f is_reference.fna.*  # BWA index files
+    # ── Cleanup ──
+    rm -f *.bam *.bam.bai is_reference.fna.* 2>/dev/null
+    return 0
+}
 
-    # Keep:
-    # - is_reference.fna (for verification)
-    # - is_circles.bed (raw Circle-Map output)
-    # - circularized_is.tsv (validated results)
-    # - status.txt
-    # - *.log files
+export -f process_sample
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE DETECTION: launcher vs. SLURM worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    # =========================================================================
+    # WORKER MODE: process a chunk of samples on a full node
+    # =========================================================================
+
+    BASE_DIR="$1"
+    BATCH_NUM="${2:-1}"
+    SAMPLES_DIR="${BASE_DIR}/samples"
+    SCRIPTS_DIR="${BASE_DIR}/scripts"
+    SAMPLE_LIST="${SCRIPTS_DIR}/.is_circle_queue_batch${BATCH_NUM}.txt"
 
     echo "=============================================="
-    echo "Complete: $SAMPLE"
+    echo "IS Circle Detection — Node Worker"
+    echo "=============================================="
+    echo "Batch: ${BATCH_NUM}, Task: ${SLURM_ARRAY_TASK_ID}"
+    echo "Host: $(hostname), CPUs: $(nproc)"
+    echo "Start: $(date)"
+    echo "=============================================="
+
+    # Activate conda environment
+    set +u
+    source $(conda info --base)/etc/profile.d/conda.sh
+    conda activate mgefinder
+    set -u
+
+    # Calculate sample range for this task
+    CHUNK_START=$(( (SLURM_ARRAY_TASK_ID - 1) * SAMPLES_PER_NODE + 1 ))
+    CHUNK_END=$(( SLURM_ARRAY_TASK_ID * SAMPLES_PER_NODE ))
+    TOTAL_IN_BATCH=$(wc -l < "$SAMPLE_LIST")
+    [[ $CHUNK_END -gt $TOTAL_IN_BATCH ]] && CHUNK_END=$TOTAL_IN_BATCH
+
+    echo "Processing samples ${CHUNK_START}-${CHUNK_END} of ${TOTAL_IN_BATCH}"
+    echo ""
+
+    # Extract chunk of samples
+    CHUNK_SAMPLES=$(sed -n "${CHUNK_START},${CHUNK_END}p" "$SAMPLE_LIST")
+    NUM_SAMPLES=$(echo "$CHUNK_SAMPLES" | wc -l)
+
+    # Process all samples in parallel (1 CPU each, up to SAMPLES_PER_NODE concurrent)
+    RUNNING=0
+    DONE=0
+    FAILED=0
+
+    for SAMPLE in $CHUNK_SAMPLES; do
+        (
+            process_sample "$SAMPLE" "$SAMPLES_DIR" "$SCRIPTS_DIR"
+        ) &
+
+        RUNNING=$((RUNNING + 1))
+
+        # Wait if we've hit the parallelism limit
+        if [[ $RUNNING -ge $SAMPLES_PER_NODE ]]; then
+            wait -n 2>/dev/null || true
+            RUNNING=$((RUNNING - 1))
+        fi
+    done
+
+    # Wait for all remaining jobs
+    wait
+
+    echo ""
+    echo "=============================================="
+    echo "Node complete: processed $NUM_SAMPLES samples"
     echo "End: $(date)"
     echo "=============================================="
     exit 0
@@ -280,12 +263,13 @@ if [[ -z "$BASE_DIR" ]]; then
     echo "Usage: bash $0 /path/to/mgefinder_batch [OPTIONS]"
     echo ""
     echo "Discovers samples ready for IS circle detection and submits SLURM array jobs."
+    echo "Each array task uses a full node (32 CPUs) to process ${SAMPLES_PER_NODE} samples in parallel."
     echo ""
     echo "Options:"
     echo "  --dry-run       Show what would be submitted, don't submit"
     echo "  --max-jobs N    Max concurrent SLURM array tasks (default: 50)"
     echo "  --force         Re-process samples even if circularized_is.tsv exists"
-    echo "  --batch-size N  Max array size per job (default: 1000)"
+    echo "  --batch-size N  Max samples per queue file (default: 1000)"
     echo ""
     echo "Examples:"
     echo "  bash $0 /global/scratch/users/kh36969/mgefinder_batch1 --dry-run"
@@ -305,6 +289,7 @@ echo "============================================"
 echo "IS Circle Detection — Sample Discovery"
 echo "============================================"
 echo "Base directory: ${BASE_DIR}"
+echo "Samples per node: ${SAMPLES_PER_NODE}"
 echo "Scanning for eligible samples..."
 echo ""
 
@@ -321,7 +306,6 @@ for dir in "${SAMPLES_DIR}"/SAM*/; do
     SAMPLE=$(basename "$dir")
     TOTAL=$((TOTAL + 1))
 
-    # Must have IS FASTA (non-empty, no NO_MGE marker)
     IS_FASTA="${dir}03.results/genome/04.makefasta.genome.all_seqs.fna"
     NO_MGE="${dir}03.results/genome/NO_MGE_DETECTED.txt"
 
@@ -333,14 +317,12 @@ for dir in "${SAMPLES_DIR}"/SAM*/; do
     fi
     HAS_IS=$((HAS_IS + 1))
 
-    # Must have FASTQ files
     if [[ ! -f "${dir}00.reads/${SAMPLE}_R1.fastq.gz" ]] || \
        [[ ! -f "${dir}00.reads/${SAMPLE}_R2.fastq.gz" ]]; then
         continue
     fi
     HAS_FASTQ=$((HAS_FASTQ + 1))
 
-    # Check if already completed
     if [[ "$FORCE" == "false" ]]; then
         if [[ -f "${dir}is_circle_analysis/circularized_is.tsv" ]]; then
             ALREADY_DONE=$((ALREADY_DONE + 1))
@@ -372,10 +354,9 @@ head -10 "$QUEUE_FILE" | sed 's/^/  /'
 [[ "$NEED_PROCESSING" -gt 10 ]] && echo "  ... and $((NEED_PROCESSING - 10)) more"
 echo ""
 
-# --- Calculate number of batches needed ---
+# --- Split into batch files and calculate array sizes ---
 NUM_BATCHES=$(( (NEED_PROCESSING + BATCH_SIZE - 1) / BATCH_SIZE ))
 
-# --- Split queue file into batch files ---
 echo "Creating ${NUM_BATCHES} batch queue file(s)..."
 for ((batch=1; batch<=NUM_BATCHES; batch++)); do
     start=$(( (batch - 1) * BATCH_SIZE + 1 ))
@@ -385,8 +366,10 @@ for ((batch=1; batch<=NUM_BATCHES; batch++)); do
     batch_file="${SCRIPTS_DIR}/.is_circle_queue_batch${batch}.txt"
     sed -n "${start},${end}p" "$QUEUE_FILE" > "$batch_file"
 
-    batch_size=$(wc -l < "$batch_file")
-    echo "  Batch ${batch}: ${batch_size} samples (lines ${start}-${end})"
+    batch_count=$(wc -l < "$batch_file")
+    # Each array task processes SAMPLES_PER_NODE samples
+    array_size=$(( (batch_count + SAMPLES_PER_NODE - 1) / SAMPLES_PER_NODE ))
+    echo "  Batch ${batch}: ${batch_count} samples → ${array_size} array tasks (${SAMPLES_PER_NODE} samples/node)"
 done
 echo ""
 
@@ -394,16 +377,16 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "[DRY RUN] Would submit ${NUM_BATCHES} batch(es):"
     for ((batch=1; batch<=NUM_BATCHES; batch++)); do
         batch_file="${SCRIPTS_DIR}/.is_circle_queue_batch${batch}.txt"
-        batch_size=$(wc -l < "$batch_file")
-        echo "  Batch ${batch}: sbatch --array=1-${batch_size}%${MAX_JOBS} $0 ${BASE_DIR} ${batch}"
-        echo "            (${batch_size} tasks)"
+        batch_count=$(wc -l < "$batch_file")
+        array_size=$(( (batch_count + SAMPLES_PER_NODE - 1) / SAMPLES_PER_NODE ))
+        echo "  Batch ${batch}: sbatch --array=1-${array_size}%${MAX_JOBS} (${batch_count} samples, ${array_size} nodes)"
     done
     echo ""
     echo "Full sample list saved to: ${QUEUE_FILE}"
     exit 0
 fi
 
-# --- Submit SLURM array job(s) in batches ---
+# --- Submit SLURM array job(s) ---
 SCRIPT_PATH="$(realpath "$0")"
 SUBMITTED_JOBS=()
 
@@ -412,10 +395,11 @@ echo ""
 
 for ((batch=1; batch<=NUM_BATCHES; batch++)); do
     batch_file="${SCRIPTS_DIR}/.is_circle_queue_batch${batch}.txt"
-    batch_size=$(wc -l < "$batch_file")
+    batch_count=$(wc -l < "$batch_file")
+    array_size=$(( (batch_count + SAMPLES_PER_NODE - 1) / SAMPLES_PER_NODE ))
 
     JOB_ID=$(sbatch \
-        --array="1-${batch_size}%${MAX_JOBS}" \
+        --array="1-${array_size}%${MAX_JOBS}" \
         --output="${LOG_DIR}/is_circle_%A_%a.out" \
         --error="${LOG_DIR}/is_circle_%A_%a.err" \
         --parsable \
@@ -425,11 +409,9 @@ for ((batch=1; batch<=NUM_BATCHES; batch++)); do
 
     echo "Batch ${batch}/${NUM_BATCHES}:"
     echo "  Job ID: ${JOB_ID}"
-    echo "  Array: 1-${batch_size} (${batch_size} tasks, max ${MAX_JOBS} concurrent)"
-    echo "  Queue: .is_circle_queue_batch${batch}.txt"
+    echo "  Array: 1-${array_size} (${batch_count} samples, ${SAMPLES_PER_NODE}/node, max ${MAX_JOBS} concurrent nodes)"
     echo ""
 
-    # Small delay to avoid overwhelming scheduler
     sleep 0.5
 done
 
@@ -443,7 +425,6 @@ echo ""
 echo "Monitor with:"
 echo "  squeue -u $USER"
 echo "  squeue -j ${SUBMITTED_JOBS[0]}"
-echo "  sacct -j ${SUBMITTED_JOBS[0]} --format=JobID,State,Elapsed"
 echo ""
 echo "Check progress:"
 echo "  ls -1 ${SAMPLES_DIR}/SAM*/is_circle_analysis/circularized_is.tsv 2>/dev/null | wc -l"

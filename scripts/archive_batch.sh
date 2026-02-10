@@ -83,17 +83,34 @@ echo "Creating archive..."
 echo "  (This may take a while for large batches)"
 echo ""
 
-tar czf "$OUTPUT" \
-    -C "$(dirname "$BASE_DIR")" \
-    --exclude="*.fastq.gz" \
-    --exclude="*.bam" \
-    --exclude="*.bam.bai" \
-    --exclude="*.bwt" \
-    --exclude="*.pac" \
-    --exclude="*.ann" \
-    --exclude="*.amb" \
-    --exclude="*.sa" \
-    "$BATCH_NAME"
+NCPU=$(nproc 2>/dev/null || echo 1)
+if command -v pigz &>/dev/null && [[ "$NCPU" -gt 1 ]]; then
+    echo "  Using pigz with ${NCPU} CPUs for parallel compression"
+    tar cf - \
+        -C "$(dirname "$BASE_DIR")" \
+        --exclude="*.fastq.gz" \
+        --exclude="*.bam" \
+        --exclude="*.bam.bai" \
+        --exclude="*.bwt" \
+        --exclude="*.pac" \
+        --exclude="*.ann" \
+        --exclude="*.amb" \
+        --exclude="*.sa" \
+        "$BATCH_NAME" | pigz -p "$NCPU" > "$OUTPUT"
+else
+    echo "  Using single-threaded gzip"
+    tar czf "$OUTPUT" \
+        -C "$(dirname "$BASE_DIR")" \
+        --exclude="*.fastq.gz" \
+        --exclude="*.bam" \
+        --exclude="*.bam.bai" \
+        --exclude="*.bwt" \
+        --exclude="*.pac" \
+        --exclude="*.ann" \
+        --exclude="*.amb" \
+        --exclude="*.sa" \
+        "$BATCH_NAME"
+fi
 
 ARCHIVE_SIZE_ACTUAL=$(du -sh "$OUTPUT" | cut -f1)
 
